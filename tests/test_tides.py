@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 
 from app.tides import (
+    bookable_departure_windows,
     calibrated_forecast_points,
     departure_windows,
     depth_deficit_audit,
@@ -216,6 +217,91 @@ def test_schedule_range_touching_tide_window_endpoint_allowed():
         [],
     )
     assert dep == BASE + timedelta(hours=4)
+
+
+# ---------------------------------------------------------------------------
+# bookable_departure_windows：扣除占用后的全部可预约出发时段
+# ---------------------------------------------------------------------------
+
+
+def test_bookable_windows_without_blockers_intersects_allowed_range():
+    # 无占用：可预约时段 = 潮汐可出发时段 ∩ 允许范围
+    windows = bookable_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE + timedelta(hours=1), BASE + timedelta(hours=3), [],
+    )
+    assert windows == [(BASE + timedelta(hours=1), BASE + timedelta(hours=3))]
+
+
+def test_bookable_windows_split_around_blocker_keep_touching_point():
+    # 占用 [01:00, 02:00] → 禁止出发 (00:00, 02:00)；00:00 出发恰与占用
+    # 首尾相接（单点保留），右侧 [02:00, 04:00] 紧随其后出发也允许
+    windows = bookable_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE, BASE + timedelta(hours=4),
+        [(BASE + timedelta(hours=1), BASE + timedelta(hours=2))],
+    )
+    assert windows == [
+        (BASE, BASE),  # 零长度单点：00:00 出发，01:00 结束，与占用首尾相接
+        (BASE + timedelta(hours=2), BASE + timedelta(hours=4)),
+    ]
+
+
+def test_bookable_windows_exact_fit_gap_is_zero_length_point():
+    # 占用 [00:00,01:00] 与 [02:00,03:00]：间隙恰好 1 小时，
+    # 只有 01:00 一个可出发时刻（零长度时段保留）
+    windows = bookable_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE, BASE + timedelta(hours=4),
+        [
+            (BASE, BASE + timedelta(hours=1)),
+            (BASE + timedelta(hours=2), BASE + timedelta(hours=3)),
+        ],
+    )
+    assert windows == [
+        (BASE + timedelta(hours=1), BASE + timedelta(hours=1)),
+        (BASE + timedelta(hours=3), BASE + timedelta(hours=4)),
+    ]
+
+
+def test_bookable_windows_multiple_tide_windows_sorted_ascending():
+    # 两个潮汐可出发时段都被占用削去头部，结果按时间升序；
+    # 05:00 出发恰在 06:00 占用前首尾相接 → 零长度单点保留
+    tide_windows = [
+        (BASE, BASE + timedelta(hours=2)),
+        (BASE + timedelta(hours=5), BASE + timedelta(hours=7)),
+    ]
+    windows = bookable_departure_windows(
+        tide_windows, DURATION,
+        BASE, BASE + timedelta(hours=7),
+        [
+            (BASE + timedelta(minutes=30), BASE + timedelta(hours=1)),
+            (BASE + timedelta(hours=6), BASE + timedelta(hours=6, minutes=30)),
+        ],
+    )
+    assert windows == [
+        (BASE + timedelta(hours=1), BASE + timedelta(hours=2)),
+        (BASE + timedelta(hours=5), BASE + timedelta(hours=5)),
+        (BASE + timedelta(hours=6, minutes=30), BASE + timedelta(hours=7)),
+    ]
+
+
+def test_bookable_windows_fully_blocked_returns_empty():
+    # 占用 [00:00, 03:30]，允许范围 00:00–02:30 内无可出发时刻
+    windows = bookable_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE, BASE + timedelta(hours=2, minutes=30),
+        [(BASE, BASE + timedelta(hours=3, minutes=30))],
+    )
+    assert windows == []
+
+
+def test_bookable_windows_range_outside_tide_windows_returns_empty():
+    windows = bookable_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE + timedelta(hours=5), BASE + timedelta(hours=6), [],
+    )
+    assert windows == []
 
 
 # ---------------------------------------------------------------------------

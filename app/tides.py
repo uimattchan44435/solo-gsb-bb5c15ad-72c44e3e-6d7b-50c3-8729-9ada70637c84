@@ -22,6 +22,9 @@
   至少 3 个才评估；局部 MAD 为邻点残差与基线差的绝对值中位数，异常阈值取
   max(0.3 米, 3 × 1.4826 × MAD)，仅返回偏离基线严格超过阈值的点（纯内存
   只读计算，不影响校准窗口与预约）。
+- 可预约时段查询：在潮汐可出发时段与请求允许范围的交集上，按“每条有效预约
+  占用 [a, b] 禁止出发 (a−时长, b)”逐条扣除（开区间，端点保留即首尾相接允许），
+  零长度但可用的单点出发时刻保留，返回剩余全部可预约出发时段（按时间升序）。
 """
 from __future__ import annotations
 
@@ -183,6 +186,46 @@ def max_supported_required_depth(
     return lo, departure
 
 
+def _remaining_departure_candidates(
+    departable_windows: list[tuple[datetime, datetime]],
+    duration_seconds: float,
+    allowed_start: datetime,
+    allowed_end: datetime,
+    blockers: list[tuple[datetime, datetime]],
+) -> list[tuple[float, float]]:
+    """扣除已有预约占用后剩余的可出发区间（Unix 秒，按时间升序）。
+
+    - 候选区间 = 潮汐可出发时段 ∩ 请求允许范围（含端点）；
+    - 已有占用 [a, b] 会禁止 d ∈ (a-时长, b)：d == a-时长（首尾相接）
+      与 d == b（紧随其后）均允许，因此从候选区间中挖掉开区间、保留两个端点；
+    - 零长度区间（单个可出发时刻）保留；
+    - 每条占用最多把每个候选区间拆为左右两段，结果始终按时间升序。
+    """
+    range_lo, range_hi = allowed_start.timestamp(), allowed_end.timestamp()
+
+    # 候选出发区间 = 潮汐可出发时段 ∩ 请求允许范围
+    candidates: list[tuple[float, float]] = []
+    for start, end in departable_windows:
+        lo = max(start.timestamp(), range_lo)
+        hi = min(end.timestamp(), range_hi)
+        if lo <= hi:
+            candidates.append((lo, hi))
+
+    for occ_start, occ_end in sorted(blockers, key=lambda x: x[0].timestamp()):
+        forbidden_lo = occ_start.timestamp() - duration_seconds
+        forbidden_hi = occ_end.timestamp()
+        remaining: list[tuple[float, float]] = []
+        for lo, hi in candidates:
+            if lo <= forbidden_lo:  # 左侧 [lo, forbidden_lo] 可出发（含相接端点）
+                remaining.append((lo, min(hi, forbidden_lo)))
+            if hi >= forbidden_hi:  # 右侧 [forbidden_hi, hi] 可出发（含相接端点）
+                remaining.append((max(lo, forbidden_hi), hi))
+        candidates = remaining
+        if not candidates:
+            break
+    return candidates
+
+
 def earliest_scheduled_departure(
     departable_windows: list[tuple[datetime, datetime]],
     duration_seconds: float,
@@ -200,34 +243,41 @@ def earliest_scheduled_departure(
 
     返回最早可出发时刻（UTC datetime）；无可用时刻返回 None。
     """
-    range_lo, range_hi = allowed_start.timestamp(), allowed_end.timestamp()
-
-    # 候选出发区间 = 潮汐可出发时段 ∩ 请求允许范围
-    candidates: list[tuple[float, float]] = []
-    for start, end in departable_windows:
-        lo = max(start.timestamp(), range_lo)
-        hi = min(end.timestamp(), range_hi)
-        if lo <= hi:
-            candidates.append((lo, hi))
-
-    # 已有占用 [a, b] 会禁止 d ∈ (a-时长, b)：d == a-时长（首尾相接）
-    # 与 d == b（紧随其后）均允许，因此从候选区间中挖掉开区间、保留两个端点。
-    for occ_start, occ_end in sorted(blockers, key=lambda x: x[0].timestamp()):
-        forbidden_lo = occ_start.timestamp() - duration_seconds
-        forbidden_hi = occ_end.timestamp()
-        remaining: list[tuple[float, float]] = []
-        for lo, hi in candidates:
-            if lo <= forbidden_lo:  # 左侧 [lo, forbidden_lo] 可出发（含相接端点）
-                remaining.append((lo, min(hi, forbidden_lo)))
-            if hi >= forbidden_hi:  # 右侧 [forbidden_hi, hi] 可出发（含相接端点）
-                remaining.append((max(lo, forbidden_hi), hi))
-        candidates = remaining
-        if not candidates:
-            return None
-
+    candidates = _remaining_departure_candidates(
+        departable_windows,
+        duration_seconds,
+        allowed_start,
+        allowed_end,
+        blockers,
+    )
     if not candidates:
         return None
     return _to_utc(min(lo for lo, _ in candidates))
+
+
+def bookable_departure_windows(
+    departable_windows: list[tuple[datetime, datetime]],
+    duration_seconds: float,
+    allowed_start: datetime,
+    allowed_end: datetime,
+    blockers: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """扣除已有预约占用后，允许范围内的全部可预约出发时段（按时间升序）。
+
+    与 earliest_scheduled_departure 共用同一套扣除规则（按请求通航时长把每条
+    占用 [a, b] 换算为禁止出发开区间 (a-时长, b)，首尾相接端点保留，零长度但
+    可用的单点出发时刻保留）。返回 [(start, end), ...]；无可用时段时为空列表。
+    """
+    return [
+        (_to_utc(lo), _to_utc(hi))
+        for lo, hi in _remaining_departure_candidates(
+            departable_windows,
+            duration_seconds,
+            allowed_start,
+            allowed_end,
+            blockers,
+        )
+    ]
 
 
 def merge_forecast_points(

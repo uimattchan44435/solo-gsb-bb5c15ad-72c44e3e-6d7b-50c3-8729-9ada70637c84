@@ -37,6 +37,11 @@
   残差与基线差的绝对值中位数，阈值取 max(0.3 米, 3×1.4826×MAD)；仅返回
   残差偏离基线严格超过阈值的点（时刻、实测潮高、残差、基线、偏离量，按时刻
   升序）；不足两预报点或无足够邻点返回空列表；查询只读，不影响校准窗口及预约。
+- 可预约时段查询：POST /ports/{id}/bookable-windows 提交吃水、安全富余、正数
+  通航分钟数与允许出发起止时刻；先按最新预报复用潮汐可出发窗口，再扣除同港
+  有效预约占用（每条预约按请求通航时长换算为禁止出发开区间，与既有通航首尾
+  相接允许，零长度但可用的单点出发时刻保留），返回允许范围内全部可预约出发
+  时段与最早时刻（按时间升序）；已取消预约不占用；查询只读。
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -47,6 +52,8 @@ from sqlite3 import Connection
 
 from .database import get_db, init_db, locked_reservation_tx, port_lock
 from .schemas import (
+    BookableWindowQuery,
+    BookableWindowResult,
     DepartureWindow,
     DepthAuditDeficit,
     DepthAuditResult,
@@ -70,6 +77,7 @@ from .schemas import (
     WindowQueryResult,
 )
 from .tides import (
+    bookable_departure_windows,
     calibrated_forecast_points,
     departure_windows,
     depth_deficit_audit,
@@ -88,7 +96,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -709,6 +717,57 @@ def audit_reservation_depth(reservation_id: int, db: Connection = Depends(get_db
             DepthAuditDeficit(start=s, end=e, max_deficit=m) for s, e, m in deficits
         ],
         sufficient=not uncovered and not deficits,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 可预约时段查询
+# ---------------------------------------------------------------------------
+
+
+@app.post("/ports/{port_id}/bookable-windows", response_model=BookableWindowResult)
+def query_bookable_windows(
+    port_id: int, payload: BookableWindowQuery, db: Connection = Depends(get_db)
+):
+    """港口航道可预约时段查询（只读，不写库）。
+
+    提交吃水、安全富余、正数通航分钟数与允许出发起止时刻：先按该港口
+    **最新预报**复用潮汐可出发窗口计算，再扣除同港**有效预约**的占用——
+    每条预约的通航区间按请求通航时长换算为禁止出发开区间
+    （占用起点 − 通航时长, 占用终点），与既有通航**首尾相接允许**（端点保留），
+    零长度但可用的单点出发时刻同样保留。返回允许范围内全部可预约出发时段
+    与最早出发时刻，按时间升序；已取消预约不占用航道。
+    """
+    port = _get_port_or_404(db, port_id)
+    points = _forecast_points(db, port_id)
+    allowed_from = _normalize(payload.allowed_departure_from)
+    allowed_to = _normalize(payload.allowed_departure_to)
+    duration_seconds = payload.duration_minutes * 60
+
+    required_depth = payload.draft + payload.safety_margin
+    tide_windows, _ = departure_windows(
+        points,
+        reference_depth=port["reference_depth"],
+        required_depth=required_depth,
+        duration_seconds=duration_seconds,
+    )
+    # 仅有效（未取消）预约占用航道；已取消预约不扣除
+    blockers = _active_blockers(db, port_id)
+    windows = bookable_departure_windows(
+        tide_windows,
+        duration_seconds=duration_seconds,
+        allowed_start=allowed_from,
+        allowed_end=allowed_to,
+        blockers=blockers,
+    )
+    return BookableWindowResult(
+        port_id=port_id,
+        required_depth=required_depth,
+        duration_minutes=payload.duration_minutes,
+        allowed_departure_from=allowed_from,
+        allowed_departure_to=allowed_to,
+        earliest_departure=windows[0][0] if windows else None,
+        windows=[DepartureWindow(start=s, end=e) for s, e in windows],
     )
 
 
