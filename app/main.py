@@ -20,6 +20,11 @@
   按查询时最新潮高预报与线性插值规则，求允许范围内全程水深达标的最大
   非负吃水（按 0.01 米向下取整）；同一吃水多个可行时刻时返回最早出发及
   通航结束时刻；范围内无可行的 0 米吃水时返回 409。
+- 可预约时段查询：提交吃水、安全富余、正数通航分钟数与允许出发起止时刻，
+  先按最新预报复用潮汐可出发窗口，再扣除同港全部有效预约的占用——每条
+  预约按本次请求的通航时长换算为禁止出发开区间（允许与既有通航首尾相接，
+  恰可贴合时保留零长度但可用的单点出发时刻）；返回允许范围内全部可预约
+  出发时段（按时刻升序）与最早时刻；已取消预约不占用，查询只读。
 - 预报影响预演：提交一批拟录入的潮高预报点，与库存预报合并（同一时刻按
   提交顺序后者覆盖前者）形成临时预报；基于一次读取的当前预报与该港口
   有效预约，分别用当前与临时预报按现有线性插值、水深复核规则判定每条
@@ -47,6 +52,8 @@ from sqlite3 import Connection
 
 from .database import get_db, init_db, locked_reservation_tx, port_lock
 from .schemas import (
+    BookableWindowQuery,
+    BookableWindowResult,
     DepartureWindow,
     DepthAuditDeficit,
     DepthAuditResult,
@@ -70,6 +77,7 @@ from .schemas import (
     WindowQueryResult,
 )
 from .tides import (
+    available_departure_windows,
     calibrated_forecast_points,
     departure_windows,
     depth_deficit_audit,
@@ -88,7 +96,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -410,6 +418,56 @@ def query_max_draft(port_id: int, payload: MaxDraftQuery, db: Connection = Depen
         required_depth=required_depth,
         departure_start=departure,
         departure_end=departure + timedelta(seconds=duration_seconds),
+    )
+
+
+@app.post("/ports/{port_id}/bookable-windows", response_model=BookableWindowResult)
+def query_bookable_windows(
+    port_id: int, payload: BookableWindowQuery, db: Connection = Depends(get_db)
+):
+    """港口航道可预约出发时段查询（只读，不写库）。
+
+    先按该港口**最新预报**复用潮汐可出发窗口（与 /windows 相同的线性插值、
+    减通航时长、覆盖不外推规则），与请求的允许出发范围取交集，再扣除该港口
+    **全部有效（未取消）预约**的占用：每条预约的通航区间 [a, b] 按**本次请求
+    的通航时长**换算为禁止出发开区间 (a − 时长, b)——出发时刻恰为 a − 时长
+    （在既有通航开始前一刻结束）或恰为 b（紧随既有通航出发）均允许，即与既有
+    通航**首尾相接**合法。扣除时保留两个端点，因此恰可贴合时会留下**零长度但
+    可用的单点出发时刻**（windows 中 start == end）。
+
+    返回允许范围内**全部**可预约出发时段（按时刻升序）与最早出发时刻；没有
+    任何可预约时刻时返回空列表与 earliest_departure=null（HTTP 200）。已取消
+    预约不占用航道；不同港口的预约互不影响。
+    """
+    port = _get_port_or_404(db, port_id)
+    points = _forecast_points(db, port_id)
+    allowed_from = _normalize(payload.allowed_departure_from)
+    allowed_to = _normalize(payload.allowed_departure_to)
+    duration_seconds = payload.duration_minutes * 60
+    required_depth = payload.draft + payload.safety_margin
+
+    tide_windows, _ = departure_windows(
+        points,
+        reference_depth=port["reference_depth"],
+        required_depth=required_depth,
+        duration_seconds=duration_seconds,
+    )
+    blockers = _active_blockers(db, port_id)
+    windows, earliest = available_departure_windows(
+        tide_windows,
+        duration_seconds=duration_seconds,
+        allowed_start=allowed_from,
+        allowed_end=allowed_to,
+        blockers=blockers,
+    )
+    return BookableWindowResult(
+        port_id=port_id,
+        required_depth=required_depth,
+        duration_minutes=payload.duration_minutes,
+        allowed_departure_from=allowed_from,
+        allowed_departure_to=allowed_to,
+        earliest_departure=earliest,
+        windows=[DepartureWindow(start=s, end=e) for s, e in windows],
     )
 
 

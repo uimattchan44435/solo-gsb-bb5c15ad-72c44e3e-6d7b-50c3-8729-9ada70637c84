@@ -1366,3 +1366,254 @@ def test_observation_anomalies_query_is_read_only(client):
 
 def test_observation_anomalies_unknown_port_404(client):
     assert client.get("/ports/999/observation-anomalies").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 可预约时段查询 POST /ports/{id}/bookable-windows
+# ---------------------------------------------------------------------------
+
+BOOKABLE_BODY = {
+    "draft": 5.0,
+    "safety_margin": 0.5,
+    "duration_minutes": 60,
+    "allowed_departure_from": "2026-09-24T00:00:00Z",
+    "allowed_departure_to": "2026-09-24T04:24:00Z",
+}
+
+
+def test_bookable_windows_without_reservations_equals_tide_windows(client):
+    port_id = _setup_port(client)
+    r = client.post(f"/ports/{port_id}/bookable-windows", json=BOOKABLE_BODY)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["port_id"] == port_id
+    assert body["required_depth"] == 5.5
+    assert body["duration_minutes"] == 60.0
+    assert body["allowed_departure_from"] == "2026-09-24T00:00:00+00:00"
+    assert body["allowed_departure_to"] == "2026-09-24T04:24:00+00:00"
+    # 无预约占用：等同潮汐可出发时段与允许范围的交集 [00:36, 04:24]
+    assert body["earliest_departure"] == "2026-09-24T00:36:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T04:24:00+00:00"}
+    ]
+
+
+def test_bookable_windows_subtracts_active_reservations(client):
+    port_id = _setup_port(client)
+    # 第一条预约排定 00:36–01:36
+    client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY)
+
+    body = client.post(
+        f"/ports/{port_id}/bookable-windows", json=BOOKABLE_BODY
+    ).json()
+    # 禁止出发开区间 (00:36 − 60min, 01:36) = (23:36, 01:36)：
+    # 起点 23:36 在允许范围外，范围内剩余 [01:36, 04:24]（01:36 紧随其后）
+    assert body["earliest_departure"] == "2026-09-24T01:36:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T01:36:00+00:00", "end": "2026-09-24T04:24:00+00:00"}
+    ]
+
+
+def test_bookable_windows_multiple_blockers_sorted(client):
+    port_id = _setup_port(client)
+    client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY)
+    client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY)
+    # 两条占用：00:36–01:36、01:36–02:36 → 剩余 [02:36, 04:24]
+    body = client.post(
+        f"/ports/{port_id}/bookable-windows", json=BOOKABLE_BODY
+    ).json()
+    assert body["earliest_departure"] == "2026-09-24T02:36:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T02:36:00+00:00", "end": "2026-09-24T04:24:00+00:00"}
+    ]
+
+
+def test_bookable_windows_keeps_single_point_touching_blocker(client):
+    port_id = _setup_port(client)
+    # 预约占用 02:00–03:00（限制其允许范围为单点 02:00 起）
+    client.post(
+        f"/ports/{port_id}/reservations",
+        json={
+            **RESERVATION_BODY,
+            "allowed_departure_from": "2026-09-24T02:00:00Z",
+            "allowed_departure_to": "2026-09-24T02:00:00Z",
+        },
+    )
+    # 本次查询同样只允许 01:00 出发：01:00 出发 02:00 结束，与占用首尾相接，
+    # 零长度单点 01:00 必须保留
+    body = client.post(
+        f"/ports/{port_id}/bookable-windows",
+        json={
+            **BOOKABLE_BODY,
+            "allowed_departure_from": "2026-09-24T01:00:00Z",
+            "allowed_departure_to": "2026-09-24T01:00:00Z",
+        },
+    ).json()
+    assert body["earliest_departure"] == "2026-09-24T01:00:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T01:00:00+00:00", "end": "2026-09-24T01:00:00+00:00"}
+    ]
+
+
+def test_bookable_windows_exact_fit_point_at_range_end(client):
+    port_id = _setup_port(client)
+    # 三条首尾相接的预约排满 00:36–03:36
+    for _ in range(3):
+        client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY)
+    # 查询只允许 03:36 出发（恰为第三条占用的终点）：单点可用
+    body = client.post(
+        f"/ports/{port_id}/bookable-windows",
+        json={
+            **BOOKABLE_BODY,
+            "allowed_departure_from": "2026-09-24T03:36:00Z",
+            "allowed_departure_to": "2026-09-24T03:36:00Z",
+        },
+    ).json()
+    assert body["earliest_departure"] == "2026-09-24T03:36:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T03:36:00+00:00", "end": "2026-09-24T03:36:00+00:00"}
+    ]
+
+
+def test_bookable_windows_fully_occupied_returns_empty_200(client):
+    port_id = _setup_port(client)
+    # 四条预约恰好排满可出发时段 [00:36, 04:24]
+    for _ in range(4):
+        client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY)
+    r = client.post(f"/ports/{port_id}/bookable-windows", json=BOOKABLE_BODY)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["windows"] == []
+    assert body["earliest_departure"] is None
+
+
+def test_bookable_windows_cancelled_reservation_does_not_block(client):
+    port_id = _setup_port(client)
+    rid = client.post(
+        f"/ports/{port_id}/reservations", json=RESERVATION_BODY
+    ).json()["id"]
+    assert client.delete(f"/reservations/{rid}").status_code == 200
+    # 取消后不再占用：可预约时段恢复为完整的潮汐交集
+    body = client.post(
+        f"/ports/{port_id}/bookable-windows", json=BOOKABLE_BODY
+    ).json()
+    assert body["earliest_departure"] == "2026-09-24T00:36:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T04:24:00+00:00"}
+    ]
+
+
+def test_bookable_windows_blockers_scoped_to_same_port(client):
+    port_id = _setup_port(client)
+    other_id = client.post(
+        "/ports", json={"name": "其他港", "reference_depth": 4.5}
+    ).json()["id"]
+    client.put(
+        f"/ports/{other_id}/tide-forecasts",
+        json={"points": [
+            {"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 0.5},
+            {"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 3.0},
+            {"forecast_time": "2026-09-24T06:00:00Z", "tide_height": 0.5},
+        ]},
+    )
+    client.post(f"/ports/{other_id}/reservations", json=RESERVATION_BODY)
+    # 其他港口的预约不影响本港可预约时段
+    body = client.post(
+        f"/ports/{port_id}/bookable-windows", json=BOOKABLE_BODY
+    ).json()
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T04:24:00+00:00"}
+    ]
+
+
+def test_bookable_windows_uses_request_duration_for_blockers(client):
+    port_id = _setup_port(client)
+    # 一条 60 分钟预约排定 00:36–01:36
+    client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY)
+    # 查询改用 120 分钟通航：禁止出发范围 (22:36, 01:36)，最早 01:36
+    body = client.post(
+        f"/ports/{port_id}/bookable-windows",
+        json={
+            **BOOKABLE_BODY,
+            "duration_minutes": 120,
+            "allowed_departure_from": "2026-09-24T00:00:00Z",
+            "allowed_departure_to": "2026-09-24T03:24:00Z",
+        },
+    ).json()
+    # 120 分钟通航的潮汐可出发时段为 [00:36, 03:24]
+    assert body["earliest_departure"] == "2026-09-24T01:36:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T01:36:00+00:00", "end": "2026-09-24T03:24:00+00:00"}
+    ]
+
+
+def test_bookable_windows_outside_coverage_empty(client):
+    port_id = _setup_port(client)
+    body = client.post(
+        f"/ports/{port_id}/bookable-windows",
+        json={
+            **BOOKABLE_BODY,
+            "allowed_departure_from": "2026-09-25T00:00:00Z",
+            "allowed_departure_to": "2026-09-25T04:00:00Z",
+        },
+    ).json()
+    assert body["windows"] == []
+    assert body["earliest_departure"] is None
+
+
+def test_bookable_windows_is_read_only(client):
+    port_id = _setup_port(client)
+    client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY)
+    client.post(
+        f"/ports/{port_id}/bookable-windows", json=BOOKABLE_BODY
+    )
+    # 查询不改预报、不增删预约
+    assert len(client.get(f"/ports/{port_id}/tide-forecasts").json()) == 3
+    listed = client.get(f"/ports/{port_id}/reservations").json()
+    assert len(listed) == 1
+    assert listed[0]["departure_start"] == "2026-09-24T00:36:00+00:00"
+
+
+def test_bookable_windows_validation_and_404(client):
+    port_id = _setup_port(client)
+    # 通航时长非正 → 422
+    assert client.post(
+        f"/ports/{port_id}/bookable-windows",
+        json={**BOOKABLE_BODY, "duration_minutes": 0},
+    ).status_code == 422
+    # 吃水为负 → 422
+    assert client.post(
+        f"/ports/{port_id}/bookable-windows",
+        json={**BOOKABLE_BODY, "draft": -0.1},
+    ).status_code == 422
+    # 允许出发范围起止颠倒 → 422
+    bad_range = {
+        **BOOKABLE_BODY,
+        "allowed_departure_from": "2026-09-24T04:24:00Z",
+        "allowed_departure_to": "2026-09-24T00:00:00Z",
+    }
+    assert client.post(
+        f"/ports/{port_id}/bookable-windows", json=bad_range
+    ).status_code == 422
+    # 缺少必填字段 → 422
+    assert client.post(
+        f"/ports/{port_id}/bookable-windows", json={"draft": 5.0}
+    ).status_code == 422
+    # 未知港口 → 404
+    assert client.post(
+        "/ports/999/bookable-windows", json=BOOKABLE_BODY
+    ).status_code == 404
+
+
+def test_bookable_windows_naive_datetime_treated_as_utc(client):
+    port_id = _setup_port(client)
+    body = client.post(
+        f"/ports/{port_id}/bookable-windows",
+        json={
+            **BOOKABLE_BODY,
+            "allowed_departure_from": "2026-09-24T00:36:00",  # 无时区 → UTC
+            "allowed_departure_to": "2026-09-24T04:24:00",
+        },
+    ).json()
+    assert body["allowed_departure_from"] == "2026-09-24T00:36:00+00:00"
+    assert body["earliest_departure"] == "2026-09-24T00:36:00+00:00"

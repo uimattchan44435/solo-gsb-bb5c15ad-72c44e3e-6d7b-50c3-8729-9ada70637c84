@@ -8,6 +8,12 @@
 - 可出发时段 = [窗口起点, 窗口终点 − 通航时长]；窗口长度不足通航时长的舍弃；
 - 预约水深复核：在排定通航区间内求水深低于所需水深的连续时段（相邻段合并，
   附各段最大欠深）；预报首末点未覆盖的通航时段单独返回，不得视为安全。
+- 预约排程与可预约时段：潮汐可出发时段与请求允许范围取交集后，对每条同港
+  有效预约的通航占用 [a, b]，按**请求通航时长**换算禁止出发开区间
+  (a − 时长, b) 并从候选区间中挖除——端点（与既有通航首尾相接）保留，
+  恰可贴合时留下零长度但可用的单点出发时刻；earliest_scheduled_departure
+  只返回最早出发时刻（供预约创建/改期），available_departure_windows 返回
+  扣除全部占用后的剩余时段与最早时刻（供只读的可预约时段查询）。
 - 最大可通航吃水：在允许出发范围内，对“所需水深 = 吃水 + 安全富余”二分搜索，
   复用达标窗口/可出发时段规则判定可行性，求允许范围内全程水深达标所能支持的
   最大所需水深；吃水 = 最大所需水深 − 安全富余，由调用方按 0.01 米向下取整。
@@ -183,14 +189,14 @@ def max_supported_required_depth(
     return lo, departure
 
 
-def earliest_scheduled_departure(
+def _departure_candidates(
     departable_windows: list[tuple[datetime, datetime]],
     duration_seconds: float,
     allowed_start: datetime,
     allowed_end: datetime,
     blockers: list[tuple[datetime, datetime]],
-) -> datetime | None:
-    """在潮汐可出发时段内、请求允许范围内，安排不与已有预约重叠的最早出发时刻。
+) -> list[tuple[float, float]]:
+    """潮汐可出发时段 ∩ 请求允许范围，再扣除已有预约换算出的禁止出发范围。
 
     - departable_windows：departure_windows 求出的可出发时段 [s, e]
       （出发时刻 d ∈ [s, e] 即可保证整个通航过程 [d, d+时长] 水深达标）；
@@ -198,7 +204,12 @@ def earliest_scheduled_departure(
     - blockers：该港口已有有效预约的通航占用区间 [占用起点, 占用终点]；
       首尾相接允许（新区间端点恰好贴住已有区间不算重叠）。
 
-    返回最早可出发时刻（UTC datetime）；无可用时刻返回 None。
+    已有占用 [a, b] 会禁止 d ∈ (a − 时长, b)：d == a − 时长（首尾相接）
+    与 d == b（紧随其后）均允许，因此从候选区间中挖掉的是开区间、两个
+    端点都保留——这会在恰好贴合时留下零长度但可用的单点出发时刻。
+
+    返回 Unix 秒时间轴上剩余的候选区间（升序、互不重叠，可能含 lo == hi
+    的单点区间）。
     """
     range_lo, range_hi = allowed_start.timestamp(), allowed_end.timestamp()
 
@@ -210,8 +221,6 @@ def earliest_scheduled_departure(
         if lo <= hi:
             candidates.append((lo, hi))
 
-    # 已有占用 [a, b] 会禁止 d ∈ (a-时长, b)：d == a-时长（首尾相接）
-    # 与 d == b（紧随其后）均允许，因此从候选区间中挖掉开区间、保留两个端点。
     for occ_start, occ_end in sorted(blockers, key=lambda x: x[0].timestamp()):
         forbidden_lo = occ_start.timestamp() - duration_seconds
         forbidden_hi = occ_end.timestamp()
@@ -223,11 +232,71 @@ def earliest_scheduled_departure(
                 remaining.append((max(lo, forbidden_hi), hi))
         candidates = remaining
         if not candidates:
-            return None
+            break
+    return candidates
 
+
+def earliest_scheduled_departure(
+    departable_windows: list[tuple[datetime, datetime]],
+    duration_seconds: float,
+    allowed_start: datetime,
+    allowed_end: datetime,
+    blockers: list[tuple[datetime, datetime]],
+) -> datetime | None:
+    """在潮汐可出发时段内、请求允许范围内，安排不与已有预约重叠的最早出发时刻。
+
+    参数语义同 _departure_candidates。返回最早可出发时刻（UTC datetime）；
+    无可用时刻返回 None。
+    """
+    candidates = _departure_candidates(
+        departable_windows,
+        duration_seconds,
+        allowed_start,
+        allowed_end,
+        blockers,
+    )
     if not candidates:
         return None
     return _to_utc(min(lo for lo, _ in candidates))
+
+
+def available_departure_windows(
+    departable_windows: list[tuple[datetime, datetime]],
+    duration_seconds: float,
+    allowed_start: datetime,
+    allowed_end: datetime,
+    blockers: list[tuple[datetime, datetime]],
+) -> tuple[list[tuple[datetime, datetime]], datetime | None]:
+    """返回允许范围内扣除预约占用后的**全部**可预约出发时段与最早时刻。
+
+    参数语义同 _departure_candidates；与 earliest_scheduled_departure 共用同一套
+    潮汐取窗、允许范围求交与占用扣除规则，但保留全部剩余区间而非只取最早点：
+
+    - 每条有效预约 [a, b] 按**本次请求的通航时长**换算为禁止出发开区间
+      (a − 时长, b)，端点允许（首尾相接），故恰可贴合时会留下零长度的
+      单点出发时刻（start == end）并照常返回；
+    - 已取消预约不在 blockers 中，不占用；
+    - 结果按时刻升序（单点区间不丢弃），最早时刻取首个区间起点；
+      无任何可预约时刻时返回 ([], None)。
+    """
+    candidates = _departure_candidates(
+        departable_windows,
+        duration_seconds,
+        allowed_start,
+        allowed_end,
+        blockers,
+    )
+    rounded = [(_to_utc(lo), _to_utc(hi)) for lo, hi in candidates]
+    # Unix 秒轴上区间互不重叠；整秒四舍五入后相邻区间可能退化为相接或重合，
+    # 合并以避免重复的单点/相邻时段（合并不改变任何可行的整秒出发时刻）。
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in rounded:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    earliest = merged[0][0] if merged else None
+    return merged, earliest
 
 
 def merge_forecast_points(

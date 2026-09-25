@@ -99,6 +99,44 @@ class WindowQueryResult(BaseModel):
     windows: list[DepartureWindow] = Field(description="全部可出发时段")
 
 
+class BookableWindowQuery(BaseModel):
+    """可预约时段查询：吃水、安全富余、正数通航分钟数与允许出发起止时刻。"""
+
+    draft: float = Field(ge=0, description="船舶吃水（米）")
+    safety_margin: float = Field(ge=0, description="安全富余（米）")
+    duration_minutes: float = Field(gt=0, description="所需通航时长（分钟），必须为正数")
+    allowed_departure_from: datetime = Field(description="允许出发范围起点（ISO 8601；无时区信息按 UTC）")
+    allowed_departure_to: datetime = Field(description="允许出发范围终点（ISO 8601；无时区信息按 UTC）")
+
+    @model_validator(mode="after")
+    def _validate_range(self):
+        start = self.allowed_departure_from
+        end = self.allowed_departure_to
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if start > end:
+            raise ValueError("allowed_departure_from 不得晚于 allowed_departure_to")
+        return self
+
+
+class BookableWindowResult(BaseModel):
+    """可预约出发时段查询结果：潮汐可出发窗口扣除同港有效预约占用后的剩余时段。"""
+
+    port_id: int
+    required_depth: float = Field(description="所需水深 = 吃水 + 安全富余（米）")
+    duration_minutes: float
+    allowed_departure_from: UtcDatetime = Field(description="请求的允许出发范围起点")
+    allowed_departure_to: UtcDatetime = Field(description="请求的允许出发范围终点")
+    earliest_departure: UtcDatetime | None = Field(
+        description="最早可预约出发时刻；无可用时刻时为 null"
+    )
+    windows: list[DepartureWindow] = Field(
+        description="全部可预约出发时段（按时刻升序；零长度时段 start == end 表示唯一可用的单点出发时刻）"
+    )
+
+
 class MaxDraftQuery(BaseModel):
     """最大可通航吃水查询：提交安全富余、正数通航分钟数与允许出发起止时刻。"""
 

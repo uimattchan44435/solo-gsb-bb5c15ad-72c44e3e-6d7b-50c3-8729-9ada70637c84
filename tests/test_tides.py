@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 
 from app.tides import (
+    available_departure_windows,
     calibrated_forecast_points,
     departure_windows,
     depth_deficit_audit,
@@ -216,6 +217,152 @@ def test_schedule_range_touching_tide_window_endpoint_allowed():
         [],
     )
     assert dep == BASE + timedelta(hours=4)
+
+
+# ---------------------------------------------------------------------------
+# available_departure_windows：可预约时段（潮汐窗口 − 允许范围 − 预约占用）
+# ---------------------------------------------------------------------------
+
+
+def test_bookable_no_blockers_returns_full_intersection():
+    # 无占用：可预约时段即可出发时段与允许范围的交集
+    windows, earliest = available_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE + timedelta(hours=1), BASE + timedelta(hours=3), [],
+    )
+    assert windows == [(BASE + timedelta(hours=1), BASE + timedelta(hours=3))]
+    assert earliest == BASE + timedelta(hours=1)
+
+
+def test_bookable_no_candidates_outside_tide_window():
+    windows, earliest = available_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE + timedelta(hours=5), BASE + timedelta(hours=6), [],
+    )
+    assert windows == []
+    assert earliest is None
+
+
+def test_bookable_single_blocker_splits_with_touching_endpoints():
+    # 占用 [01:00, 02:00] → 禁止出发开区间 (00:00, 02:00)：
+    # 剩余 [00:00, 00:00]（恰在占用开始前结束）与 [02:00, 04:00]
+    windows, earliest = available_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE, BASE + timedelta(hours=4),
+        [(BASE + timedelta(hours=1), BASE + timedelta(hours=2))],
+    )
+    assert windows == [
+        (BASE, BASE),  # 零长度单点：00:00 出发、01:00 结束，首尾相接
+        (BASE + timedelta(hours=2), BASE + timedelta(hours=4)),
+    ]
+    assert earliest == BASE
+
+
+def test_bookable_two_blockers_keep_single_point_between():
+    # 占用 [00:30, 01:30] 与 [02:30, 03:30]：
+    # 禁止 (23:30, 01:30) 与 (01:30, 03:30) → 01:30 既是前者右端点又是后者右端点
+    windows, earliest = available_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE, BASE + timedelta(hours=4),
+        [
+            (BASE + timedelta(minutes=30), BASE + timedelta(hours=1, minutes=30)),
+            (BASE + timedelta(hours=2, minutes=30), BASE + timedelta(hours=3, minutes=30)),
+        ],
+    )
+    assert windows == [
+        (BASE + timedelta(hours=1, minutes=30), BASE + timedelta(hours=1, minutes=30)),
+        (BASE + timedelta(hours=3, minutes=30), BASE + timedelta(hours=4)),
+    ]
+    assert earliest == BASE + timedelta(hours=1, minutes=30)
+
+
+def test_bookable_exact_fit_between_blockers():
+    # 占用 [00:00,01:00]、[02:00,03:00]：间隙恰好 1 小时，01:00 出发 02:00 结束
+    windows, earliest = available_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE, BASE + timedelta(hours=4),
+        [
+            (BASE, BASE + timedelta(hours=1)),
+            (BASE + timedelta(hours=2), BASE + timedelta(hours=3)),
+        ],
+    )
+    assert windows == [
+        (BASE + timedelta(hours=1), BASE + timedelta(hours=1)),
+        (BASE + timedelta(hours=3), BASE + timedelta(hours=4)),
+    ]
+    assert earliest == BASE + timedelta(hours=1)
+
+
+def test_bookable_blocker_uses_request_duration_not_its_own():
+    # 占用 [02:00, 03:00]（其自身通航 1 小时），但**本次请求**通航 2 小时：
+    # 禁止出发范围按请求时长换算为 (00:00, 03:00)，而非按占用自身时长得到
+    # 的 (01:00, 03:00)。端点 00:00 允许（00:00 出发、02:00 结束，首尾相接）
+    # → 保留为零长度单点；右侧 [03:00, 04:00] 正常保留。
+    windows, earliest = available_departure_windows(
+        DEP_WINDOWS, 2 * DURATION,
+        BASE, BASE + timedelta(hours=4),
+        [(BASE + timedelta(hours=2), BASE + timedelta(hours=3))],
+    )
+    assert windows == [
+        (BASE, BASE),
+        (BASE + timedelta(hours=3), BASE + timedelta(hours=4)),
+    ]
+    assert earliest == BASE
+
+
+def test_bookable_blocker_covering_range_returns_empty():
+    # 占用 [00:00, 03:30]，允许范围 00:00–02:30：禁止 (23:00, 03:30)，
+    # 其起点早于允许范围，端点 00:00 落在开区间内部（非端点），整个允许
+    # 范围都在开区间内 → 空
+    windows, earliest = available_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE, BASE + timedelta(hours=2, minutes=30),
+        [(BASE, BASE + timedelta(hours=3, minutes=30))],
+    )
+    assert windows == []
+    assert earliest is None
+
+
+def test_bookable_forbidden_start_inside_range_keeps_left_point():
+    # 占用 [01:00, 02:00]，允许范围 01:00–03:00：禁止 (00:00, 02:00)，
+    # 左端点 00:00 在范围外，范围内可保留的是开区间右边界 02:00（紧随
+    # 占用出发）；[02:00, 03:00]
+    windows, earliest = available_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE + timedelta(hours=1), BASE + timedelta(hours=3),
+        [(BASE + timedelta(hours=1), BASE + timedelta(hours=2))],
+    )
+    assert windows == [
+        (BASE + timedelta(hours=2), BASE + timedelta(hours=3)),
+    ]
+    assert earliest == BASE + timedelta(hours=2)
+
+
+def test_bookable_blocker_starting_at_range_left_keeps_left_point():
+    # 占用 [01:00, 02:00]，允许范围 00:00–02:30：禁止 (00:00, 02:00)，
+    # 允许范围左端点 00:00 恰为开区间左边界（00:00 出发、01:00 结束，
+    # 首尾相接）→ 保留为单点，其后为 [02:00, 02:30]
+    windows, earliest = available_departure_windows(
+        DEP_WINDOWS, DURATION,
+        BASE, BASE + timedelta(hours=2, minutes=30),
+        [(BASE + timedelta(hours=1), BASE + timedelta(hours=2))],
+    )
+    assert windows == [
+        (BASE, BASE),
+        (BASE + timedelta(hours=2), BASE + timedelta(hours=2, minutes=30)),
+    ]
+    assert earliest == BASE
+
+
+def test_bookable_zero_length_tide_window_kept_as_point():
+    # 潮汐可出发时段本身退化为单点 [02:00, 02:00]，无占用时应保留
+    point_window = [(BASE + timedelta(hours=2), BASE + timedelta(hours=2))]
+    windows, earliest = available_departure_windows(
+        point_window, DURATION,
+        BASE, BASE + timedelta(hours=4), [],
+    )
+    assert windows == [(BASE + timedelta(hours=2), BASE + timedelta(hours=2))]
+    assert earliest == BASE + timedelta(hours=2)
 
 
 # ---------------------------------------------------------------------------
